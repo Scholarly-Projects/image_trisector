@@ -1,108 +1,109 @@
 import os
-import torch
-import numpy as np
 import cv2
+import numpy as np
 from PIL import Image
-from torchvision.transforms import Compose, ToTensor, Resize, Normalize
+import torch
+from torchvision import transforms
 
-# Load a smaller MiDaS model for depth estimation to avoid large file size issues
-def load_midas_model():
-    model_type = "MiDaS_small"  # Use a smaller model to reduce dependencies
-    midas = torch.hub.load("intel-isl/MiDaS", model_type)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    midas.to(device)
+# Load the MiDaS model
+def load_midas_model(device):
+    midas = torch.hub.load("intel-isl/MiDaS", "MiDaS", pretrained=True)
     midas.eval()
+    midas.to(device)
+    return midas
 
-    midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
+# Define the transformation
+def get_transform():
+    return transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Resize((384, 384)),  # Adjust as needed
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
 
-    return midas, midas_transforms, device
-
-# Perform depth estimation using the MiDaS model
-def estimate_depth(image, midas, midas_transforms, device):
-    input_batch = midas_transforms(image).to(device)
-
+def estimate_depth(image_tensor, midas, device):
     with torch.no_grad():
-        prediction = midas(input_batch)
-        prediction = torch.nn.functional.interpolate(
-            prediction.unsqueeze(1),
-            size=image.shape[:2],
-            mode="bicubic",
-            align_corners=False,
-        ).squeeze()
+        depth_map = midas(image_tensor.unsqueeze(0).to(device))  # Add batch dimension
+    return depth_map.squeeze().cpu().numpy()  # Remove batch dimension and convert to NumPy array
 
-    depth_map = prediction.cpu().numpy()
-    return depth_map
+def split_image(image_path, output_folder, filename, midas, transform, device):
+    print(f"Processing image: {image_path}")
 
-# Segment image into foreground, middle ground, and background based on depth
-def segment_by_depth(image, depth_map):
-    # Normalize depth values
-    min_depth, max_depth = np.min(depth_map), np.max(depth_map)
-    depth_map_normalized = (depth_map - min_depth) / (max_depth - min_depth)
+    # Load image
+    image_np = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if image_np is None:
+        print(f"Error loading image: {image_path}")
+        return
 
-    # Define thresholds for splitting based on depth
-    foreground_threshold = 0.3
-    middle_ground_threshold = 0.6
+    # Resize while maintaining aspect ratio
+    h, w, _ = image_np.shape
+    new_w = 640  # Set desired width
+    new_h = int((new_w / w) * h)
+    image_np_resized = cv2.resize(image_np, (new_w, new_h))
 
-    # Create masks for foreground, middle ground, and background
-    foreground_mask = depth_map_normalized < foreground_threshold
-    middle_ground_mask = (depth_map_normalized >= foreground_threshold) & (depth_map_normalized < middle_ground_threshold)
-    background_mask = depth_map_normalized >= middle_ground_threshold
+    # Convert NumPy array to PIL Image
+    image_pil = Image.fromarray(cv2.cvtColor(image_np_resized, cv2.COLOR_BGR2RGB))  # Convert from BGR to RGB
 
-    # Apply masks to the image
-    foreground = np.copy(image)
-    foreground[~foreground_mask] = [0, 0, 0, 0]  # Apply transparency where it's not foreground
-
-    middle_ground = np.copy(image)
-    middle_ground[~middle_ground_mask] = [0, 0, 0, 0]  # Apply transparency where it's not middle ground
-
-    background = np.copy(image)
-    background[~background_mask] = [0, 0, 0, 0]  # Apply transparency where it's not background
-
-    return foreground, middle_ground, background
-
-# Function to split an image using depth estimation into foreground, middle ground, and background
-def split_image(image_path, output_folder, filename, midas, midas_transforms, device):
-    # Load image and convert to RGB
-    image = Image.open(image_path).convert('RGB')
-    image_np = np.array(image)
+    # Apply transformations
+    image_tensor = transform(image_pil)  # Apply transform to PIL image
 
     # Estimate depth
-    depth_map = estimate_depth(image_np, midas, midas_transforms, device)
+    depth_map = estimate_depth(image_tensor, midas, device)
 
-    # Segment image based on depth map
-    foreground, middle_ground, background = segment_by_depth(image_np, depth_map)
+    # Ensure depth map has the same dimensions as the resized image
+    depth_map_resized = cv2.resize(depth_map, (new_w, new_h))
 
-    # Save the output images with transparency (RGBA)
-    foreground_img = Image.fromarray(foreground.astype(np.uint8)).convert('RGBA')
-    middle_ground_img = Image.fromarray(middle_ground.astype(np.uint8)).convert('RGBA')
-    background_img = Image.fromarray(background.astype(np.uint8)).convert('RGBA')
+    # Create binary masks for foreground, middle ground, and background based on depth thresholds
+    foreground_mask = depth_map_resized < 0.5
+    middle_ground_mask = (depth_map_resized >= 0.5) & (depth_map_resized < 0.8)
+    background_mask = depth_map_resized >= 0.8
 
-    foreground_img.save(os.path.join(output_folder, f"{filename}_foreground.png"))
-    middle_ground_img.save(os.path.join(output_folder, f"{filename}_middle_ground.png"))
-    background_img.save(os.path.join(output_folder, f"{filename}_background.png"))
+    # Create output images with transparency
+    foreground_image = np.zeros_like(image_np_resized, dtype=np.uint8)
+    middle_ground_image = np.zeros_like(image_np_resized, dtype=np.uint8)
+    background_image = np.zeros_like(image_np_resized, dtype=np.uint8)
 
-    print(f"Saved trisected images for {filename}")
+    # Apply masks to create separate images
+    foreground_image[foreground_mask] = image_np_resized[foreground_mask]
+    middle_ground_image[middle_ground_mask] = image_np_resized[middle_ground_mask]
+    background_image[background_mask] = image_np_resized[background_mask]
 
-# Function to process images in folder A and output to folder B
-def process_images(input_folder, output_folder, midas, midas_transforms, device):
-    if not os.path.exists(output_folder):
-        os.makedirs(output_folder)
+    # Convert to RGBA for transparency
+    foreground_image = cv2.cvtColor(foreground_image, cv2.COLOR_BGR2RGBA)
+    middle_ground_image = cv2.cvtColor(middle_ground_image, cv2.COLOR_BGR2RGBA)
+    background_image = cv2.cvtColor(background_image, cv2.COLOR_BGR2RGBA)
 
+    # Add transparency
+    foreground_image[..., 3] = (foreground_mask * 255).astype(np.uint8)  # Foreground mask as alpha channel
+    middle_ground_image[..., 3] = (middle_ground_mask * 255).astype(np.uint8)  # Middle ground mask as alpha channel
+    background_image[..., 3] = (background_mask * 255).astype(np.uint8)  # Background mask as alpha channel
+
+    # Save images as PNG
+    fg_output_path = os.path.join(output_folder, f"{filename}_foreground.png")
+    mg_output_path = os.path.join(output_folder, f"{filename}_middle_ground.png")
+    bg_output_path = os.path.join(output_folder, f"{filename}_background.png")
+
+    print(f"Saving images to {fg_output_path}, {mg_output_path}, {bg_output_path}")
+    
+    cv2.imwrite(fg_output_path, foreground_image)
+    cv2.imwrite(mg_output_path, middle_ground_image)
+    cv2.imwrite(bg_output_path, background_image)
+
+    print("Images saved successfully.")
+
+def process_images(input_folder, output_folder, midas, transform, device):
     for filename in os.listdir(input_folder):
-        if filename.lower().endswith((".jpg", ".jpeg", ".png", ".tiff")):
+        if filename.lower().endswith(('.jpg', '.jpeg', '.png', '.tiff')):
             input_image_path = os.path.join(input_folder, filename)
-            print(f"Processing {filename}...")
+            split_image(input_image_path, output_folder, os.path.splitext(filename)[0], midas, transform, device)
 
-            # Split the image into three parts based on depth
-            split_image(input_image_path, output_folder, os.path.splitext(filename)[0], midas, midas_transforms, device)
+# Set up device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-if __name__ == "__main__":
-    # Folder A contains the input images, and Folder B will hold the output images
-    input_folder = "A"
-    output_folder = "B"
+# Initialize midas and transform
+midas = load_midas_model(device)
+transform = get_transform()
 
-    # Load MiDaS model and transformations
-    midas, midas_transforms, device = load_midas_model()
-
-    # Process images using depth-based segmentation
-    process_images(input_folder, output_folder, midas, midas_transforms, device)
+# Call process_images with the input and output folder paths
+input_folder = 'image_trisector/A'  # Assuming A is a folder in the current directory
+output_folder = 'image_trisector/B'  # Assuming B is a folder in the current directory
+process_images(input_folder, output_folder, midas, transform, device)
